@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
 use crate::bindings::{self, Evaluator};
+use crate::validation;
 
 pub const BASIC_CATALOG_V1: &str =
     "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json";
@@ -45,20 +46,48 @@ impl Version {
             _ => "call",
         }
     }
+
+    pub(crate) fn checks_key(self) -> &'static str {
+        match self {
+            Self::V1 => "@checks",
+            _ => "checks",
+        }
+    }
 }
 
 #[derive(Debug)]
-pub struct ProtocolError(String);
+pub struct ProtocolError {
+    message: String,
+    path: Option<String>,
+}
 
 impl ProtocolError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            path: None,
+        }
+    }
+
+    pub(crate) fn at(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            path: Some(path.into()),
+        }
+    }
+
+    /// The JSON Pointer within the inbound message, when known.
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
     }
 }
 
 impl fmt::Display for ProtocolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        if let Some(path) = &self.path {
+            write!(formatter, "{path}: ")?;
+        }
+        self.message.fmt(formatter)
     }
 }
 
@@ -136,24 +165,32 @@ impl Surface {
 
     pub(crate) fn failed_checks(&self, component: &Component, scope: &str) -> Vec<String> {
         component
-            .property("checks")
+            .property(self.version.checks_key())
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|check| {
                 let condition = check.get("condition").unwrap_or(check);
-                let valid = self.resolve(condition, scope).as_bool() == Some(true);
-                (!valid).then(|| bindings::text(&self.resolve(&check["message"], scope)))
+                let result = self.resolve(condition, scope);
+                if bindings::boolean(&result, self.version) {
+                    return None;
+                }
+                if self.version == Version::V1
+                    && let Some(message) = result["message"].as_str()
+                {
+                    return Some(message.to_owned());
+                }
+                Some(bindings::text(&self.resolve(&check["message"], scope)))
             })
             .collect()
     }
 
     pub fn action(&self, component_id: &str, scope: &str) -> Option<ClientEvent> {
         let component = self.component(component_id)?;
-        if !self.supports_component(component) || !self.failed_checks(component, scope).is_empty() {
+        let event = component.property("action").get("event")?;
+        if !self.can_activate(component, scope) {
             return None;
         }
-        let event = component.property("action").get("event")?;
         let context = event["context"]
             .as_object()
             .into_iter()
@@ -174,6 +211,10 @@ impl Surface {
             },
             data_model: self.send_data_model.then(|| self.data_model.clone()),
         })
+    }
+
+    pub(crate) fn can_activate(&self, component: &Component, scope: &str) -> bool {
+        self.supports_component(component) && self.failed_checks(component, scope).is_empty()
     }
 }
 
@@ -240,29 +281,48 @@ impl Document {
                 "Expected a version and exactly one A2UI message.",
             ));
         }
-        let version: Version = decode(envelope.remove("version").unwrap_or(Value::Null))?;
+        let version: Version = decode(envelope.remove("version").unwrap_or(Value::Null))
+            .map_err(|error| ProtocolError::at("/version", error.to_string()))?;
         let (kind, payload) = envelope
             .into_iter()
             .next()
             .expect("checked envelope length");
+        if version == Version::V1 {
+            validation::payload(&kind, &payload)?;
+        }
         match kind.as_str() {
             "createSurface" => self.create(version, decode(payload)?),
             "updateComponents" => {
                 let message: UpdateComponents = decode(payload)?;
-                let components = component_map(message.components)?;
-                self.require_surface(&message.surface_id, version)?
-                    .components
-                    .extend(components);
+                let surface = self.require_surface(&message.surface_id, version)?;
+                let components = component_map(
+                    message.components,
+                    version,
+                    surface.catalog_id.as_deref(),
+                    "/updateComponents/components",
+                )?;
+                if version == Version::V1 {
+                    validation::component_graph(
+                        &surface.components,
+                        &components,
+                        "/updateComponents/components",
+                    )?;
+                }
+                surface.components.extend(components);
                 Ok(())
             }
             "updateDataModel" => {
                 let message: UpdateData = decode(payload)?;
                 let surface = self.require_surface(&message.surface_id, version)?;
+                let value = message
+                    .value
+                    .filter(|value| version != Version::V1 || !value.is_null());
                 bindings::update(
                     &mut surface.data_model,
                     message.path.as_deref().unwrap_or("/"),
-                    message.value,
+                    value,
                 )
+                .map_err(|error| ProtocolError::at("/updateDataModel/path", error.to_string()))
             }
             "deleteSurface" => {
                 let message: SurfaceRef = decode(payload)?;
@@ -300,7 +360,19 @@ impl Document {
             }
             _ => {}
         }
-        let components = component_map(message.components)?;
+        let components = component_map(
+            message.components,
+            version,
+            message.catalog_id.as_deref(),
+            "/createSurface/components",
+        )?;
+        if version == Version::V1 {
+            validation::component_graph(
+                &BTreeMap::new(),
+                &components,
+                "/createSurface/components",
+            )?;
+        }
         self.next_generation += 1;
         self.surfaces.push(Surface {
             id: message.surface_id,
@@ -337,11 +409,20 @@ fn decode<T: DeserializeOwned>(payload: Value) -> Result<T, ProtocolError> {
     Ok(serde_json::from_value(payload)?)
 }
 
-fn component_map(components: Vec<Component>) -> Result<BTreeMap<String, Component>, ProtocolError> {
+fn component_map(
+    components: Vec<Component>,
+    version: Version,
+    catalog_id: Option<&str>,
+    path: &str,
+) -> Result<BTreeMap<String, Component>, ProtocolError> {
     let mut ids = BTreeSet::new();
-    for component in &components {
+    for (index, component) in components.iter().enumerate() {
+        if version == Version::V1 {
+            validation::component(component, catalog_id, &format!("{path}/{index}"))?;
+        }
         if component.id.is_empty() || component.kind.is_empty() || !ids.insert(&component.id) {
-            return Err(ProtocolError::new(
+            return Err(ProtocolError::at(
+                format!("{path}/{index}/id"),
                 "Component IDs and types must be nonempty, and each update must use distinct IDs.",
             ));
         }

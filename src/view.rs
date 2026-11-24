@@ -1,6 +1,7 @@
 mod widgets;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, Sizable,
@@ -20,6 +21,27 @@ use crate::{ClientEvent, Component, Document, ProtocolError, Surface};
 pub struct A2uiView {
     document: Document,
     state: ViewState,
+    urls: UrlPolicy,
+}
+
+/// The operation the host is being asked to allow for an agent-provided URL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceKind {
+    Image,
+    Navigation,
+}
+
+type UrlAuthorizer = dyn Fn(ResourceKind, &Url) -> bool + Send + Sync;
+
+#[derive(Clone, Default)]
+struct UrlPolicy(Option<Arc<UrlAuthorizer>>);
+
+impl UrlPolicy {
+    fn allowed(&self, kind: ResourceKind, raw: &str) -> Option<Url> {
+        let authorize = self.0.as_ref()?;
+        let url = web_url(raw)?;
+        authorize(kind, &url).then_some(url)
+    }
 }
 
 #[derive(Default)]
@@ -65,6 +87,18 @@ impl NodeKey {
 impl EventEmitter<ClientEvent> for A2uiView {}
 
 impl A2uiView {
+    /// Opt in to specific HTTP(S) URLs for images or user-initiated navigation.
+    /// The default view denies both. The host's HTTP client must apply the same
+    /// image policy to redirects or disable them.
+    pub fn with_url_policy(
+        authorize: impl Fn(ResourceKind, &Url) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            urls: UrlPolicy(Some(Arc::new(authorize))),
+            ..Self::default()
+        }
+    }
+
     pub fn document(&self) -> &Document {
         &self.document
     }
@@ -126,13 +160,17 @@ impl A2uiView {
         let Some(node) = surface.component(&key.component) else {
             return;
         };
-        if !surface.failed_checks(node, &key.scope).is_empty() {
-            return;
-        }
         let call = &node.property("action")["functionCall"];
-        if call[surface.version.call_key()].as_str() == Some("openUrl") {
+        let catalog = call["catalogId"].as_str().or(surface.catalog_id.as_deref());
+        if call[surface.version.call_key()].as_str() == Some("openUrl")
+            && catalog.is_some_and(|catalog| surface.version.supports(catalog))
+            && surface.can_activate(node, &key.scope)
+        {
             let url = surface.resolve(&call["args"]["url"], &key.scope);
-            if let Some(url) = url.as_str().and_then(web_url) {
+            if let Some(url) = url
+                .as_str()
+                .and_then(|url| self.urls.allowed(ResourceKind::Navigation, url))
+            {
                 cx.open_url(url.as_str());
             }
         }
@@ -168,6 +206,7 @@ impl Render for A2uiView {
             let mut renderer = SurfaceRenderer {
                 surface,
                 state: &self.state,
+                urls: &self.urls,
                 window,
                 cx,
                 budget: 4_096,
@@ -181,7 +220,7 @@ impl Render for A2uiView {
                 .theme
                 .get("iconUrl")
                 .and_then(Value::as_str)
-                .and_then(web_url);
+                .and_then(|url| self.urls.allowed(ResourceKind::Image, url));
             elements.push(
                 div()
                     .w_full()
@@ -251,6 +290,7 @@ impl Render for A2uiView {
 struct SurfaceRenderer<'a, 'context> {
     surface: &'a Surface,
     state: &'a ViewState,
+    urls: &'a UrlPolicy,
     window: &'a mut Window,
     cx: &'a mut Context<'context, A2uiView>,
     budget: usize,
@@ -347,12 +387,13 @@ impl SurfaceRenderer<'_, '_> {
         let weight = node
             .property("weight")
             .as_f64()
-            .filter(|weight| *weight > 0.0);
+            .map(|weight| weight as f32)
+            .filter(|weight| weight.is_finite() && *weight > 0.0);
         match weight {
             Some(weight) => div()
                 .min_w_0()
                 .flex_basis(px(0.))
-                .flex_grow(weight as f32)
+                .flex_grow(weight)
                 .child(element)
                 .into_any_element(),
             None => element,
@@ -409,16 +450,21 @@ impl SurfaceRenderer<'_, '_> {
                 this.text_color(self.cx.theme().muted_foreground)
             })
             .child(if markdown {
+                let images = self.urls.clone();
+                let navigation = self.urls.clone();
                 TextView::markdown(key.id("markdown"), text)
-                    .image_source(|uri| {
-                        web_url(uri.as_ref())
+                    .image_source(move |uri| {
+                        images
+                            .allowed(ResourceKind::Image, uri.as_ref())
                             .map(|url| ImageSource::from(url.to_string()))
                             .unwrap_or_else(|| {
                                 ImageSource::from(|_: &mut Window, _: &mut App| None)
                             })
                     })
-                    .on_link_click(|url, _, _, cx| {
-                        if let Some(url) = web_url(url.as_ref()) {
+                    .on_link_click(move |url, _, _, cx| {
+                        if let Some(url) =
+                            navigation.allowed(ResourceKind::Navigation, url.as_ref())
+                        {
                             cx.open_url(url.as_str());
                         }
                     })
@@ -430,7 +476,10 @@ impl SurfaceRenderer<'_, '_> {
     }
 
     fn image(&self, node: &Component, scope: &str) -> AnyElement {
-        let Some(url) = web_url(&self.string(node, "url", scope)) else {
+        let Some(url) = self
+            .urls
+            .allowed(ResourceKind::Image, &self.string(node, "url", scope))
+        else {
             return self.placeholder("Image unavailable");
         };
         let fit = match node.property("fit").as_str() {
@@ -438,6 +487,8 @@ impl SurfaceRenderer<'_, '_> {
             Some("fill") => ObjectFit::Fill,
             Some("none") => ObjectFit::None,
             Some("scaleDown") => ObjectFit::ScaleDown,
+            Some("contain") => ObjectFit::Contain,
+            _ if self.surface.version == crate::Version::V1 => ObjectFit::Fill,
             _ => ObjectFit::Contain,
         };
         let (width, height) = match node.property("variant").as_str() {
@@ -445,6 +496,7 @@ impl SurfaceRenderer<'_, '_> {
             Some("avatar") => (48., 48.),
             Some("smallFeature") => (128., 88.),
             Some("mediumFeature") => (240., 144.),
+            None if self.surface.version == crate::Version::V1 => (240., 144.),
             _ => (440., 220.),
         };
         img(url.to_string())
@@ -502,9 +554,11 @@ impl SurfaceRenderer<'_, '_> {
     }
 
     fn media(&self, node: &Component, key: &NodeKey) -> AnyElement {
-        let Some(url) = web_url(&self.string(node, "url", &key.scope)) else {
+        let raw = self.string(node, "url", &key.scope);
+        if self.urls.allowed(ResourceKind::Navigation, &raw).is_none() {
             return self.placeholder("Media unavailable");
-        };
+        }
+        let navigation = self.urls.clone();
         let label = if node.kind == "Video" {
             "Open video"
         } else {
@@ -517,7 +571,11 @@ impl SurfaceRenderer<'_, '_> {
             .child(
                 Button::new(key.id("media"))
                     .label(label)
-                    .on_click(move |_, _, cx| cx.open_url(url.as_str())),
+                    .on_click(move |_, _, cx| {
+                        if let Some(url) = navigation.allowed(ResourceKind::Navigation, &raw) {
+                            cx.open_url(url.as_str());
+                        }
+                    }),
             )
             .child(self.string(node, "description", &key.scope))
             .into_any_element()
@@ -666,7 +724,12 @@ impl SurfaceRenderer<'_, '_> {
     where
         Self: 'a,
     {
-        let Some(items) = node.property("tabItems").as_array() else {
+        let property = if self.surface.version == crate::Version::V1 {
+            "tabs"
+        } else {
+            "tabItems"
+        };
+        let Some(items) = node.property(property).as_array() else {
             return div().into_any_element();
         };
         let active = self
@@ -836,11 +899,61 @@ impl SurfaceRenderer<'_, '_> {
     }
 }
 
-pub(crate) fn web_url(raw: &str) -> Option<Url> {
+fn web_url(raw: &str) -> Option<Url> {
+    let raw = raw.trim_matches(|ch: char| ch.is_whitespace() || ch.is_control());
+    let (scheme, authority) = raw.split_once("://")?;
+    if !(scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
+        || authority.starts_with(['/', '\\'])
+        || raw.chars().any(|ch| ch.is_control() || ch == '\\')
+    {
+        return None;
+    }
     let url = Url::parse(raw).ok()?;
     (matches!(url.scheme(), "https" | "http")
         && url.host().is_some()
         && url.username().is_empty()
         && url.password().is_none())
     .then_some(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{A2uiView, ResourceKind};
+
+    #[test]
+    fn agent_urls_require_host_opt_in_for_each_operation() {
+        let image = "https://media.example/image.png";
+        let default = A2uiView::default();
+        assert!(default.urls.allowed(ResourceKind::Image, image).is_none());
+        assert!(
+            default
+                .urls
+                .allowed(ResourceKind::Navigation, image)
+                .is_none()
+        );
+
+        let opted_in = A2uiView::with_url_policy(|kind, url| {
+            kind == ResourceKind::Image
+                && url.scheme() == "https"
+                && url.host_str() == Some("media.example")
+                && url.port().is_none()
+        });
+        assert!(opted_in.urls.allowed(ResourceKind::Image, image).is_some());
+        assert!(
+            opted_in
+                .urls
+                .allowed(ResourceKind::Navigation, image)
+                .is_none()
+        );
+        for url in [
+            "https://media.example:8443/image.png",
+            "https://other.example/image.png",
+            "https://someone@media.example/image.png",
+            "https:/media.example/image.png",
+            "https:///media.example/image.png",
+            "file:///image.png",
+        ] {
+            assert!(opted_in.urls.allowed(ResourceKind::Image, url).is_none());
+        }
+    }
 }

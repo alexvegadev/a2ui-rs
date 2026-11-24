@@ -117,6 +117,19 @@ pub(crate) fn text(value: &Value) -> String {
     }
 }
 
+pub(crate) fn boolean(value: &Value, version: Version) -> bool {
+    if version != Version::V1 {
+        return value.as_bool() == Some(true);
+    }
+    match value {
+        Value::Bool(value) => *value,
+        Value::String(value) => value.eq_ignore_ascii_case("true"),
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::Object(value) => value.get("valid").and_then(Value::as_bool) == Some(true),
+        _ => false,
+    }
+}
+
 pub(crate) struct Evaluator<'a> {
     model: &'a Value,
     scope: &'a str,
@@ -184,38 +197,44 @@ impl<'a> Evaluator<'a> {
 
     fn call(&self, name: &str, args: &Value, depth: usize) -> Value {
         let value = &args["value"];
+        let validation_result = |valid: bool| match self.version {
+            Version::V1 => json!({ "valid": valid }),
+            _ => json!(valid),
+        };
         match name {
-            "required" => json!(match value {
+            "required" => validation_result(match value {
                 Value::Null => false,
                 Value::String(value) => !value.is_empty(),
                 Value::Array(value) => !value.is_empty(),
                 _ => true,
             }),
-            "regex" => json!(
+            "regex" => validation_result(value.as_str().zip(args["pattern"].as_str()).is_some_and(
+                |(value, pattern)| {
+                    pattern.len() <= 2_048
+                        && Regex::new(pattern).is_ok_and(|regex| regex.is_match(value))
+                },
+            )),
+            "length" => validation_result(
                 value
                     .as_str()
-                    .zip(args["pattern"].as_str())
-                    .is_some_and(|(value, pattern)| pattern.len() <= 2_048
-                        && Regex::new(pattern).is_ok_and(|regex| regex.is_match(value)))
+                    .is_some_and(|value| in_range(value.chars().count() as f64, args)),
             ),
-            "length" => json!(
-                value
-                    .as_str()
-                    .is_some_and(|value| in_range(value.chars().count() as f64, args))
-            ),
-            "numeric" => json!(number(value).is_some_and(|value| in_range(value, args))),
-            "email" => json!(value.as_str().is_some_and(valid_email)),
+            "numeric" => {
+                validation_result(number(value).is_some_and(|value| in_range(value, args)))
+            }
+            "email" => validation_result(value.as_str().is_some_and(valid_email)),
             "and" | "or" => {
                 let Some(items) = args["values"].as_array() else {
                     return Value::Null;
                 };
-                let mut values = items.iter().map(|item| item.as_bool() == Some(true));
+                let mut values = items.iter().map(|item| boolean(item, self.version));
                 json!(if name == "and" {
                     values.all(|value| value)
                 } else {
                     values.any(|value| value)
                 })
             }
+            "not" if self.version == Version::V1 => json!(!boolean(value, self.version)),
             "not" => value
                 .as_bool()
                 .map(|value| json!(!value))

@@ -26,7 +26,7 @@ impl SurfaceRenderer<'_, '_> {
                 let key = key.clone();
                 let checkbox = Checkbox::new(key.id("check"))
                     .label(label)
-                    .checked(value.as_bool().unwrap_or(false))
+                    .checked(crate::bindings::boolean(&value, self.surface.version))
                     .disabled(locked)
                     .on_click(self.cx.listener(move |this, checked: &bool, _, cx| {
                         this.edit(&key, Value::Bool(*checked), cx);
@@ -162,18 +162,23 @@ impl SurfaceRenderer<'_, '_> {
             return self.placeholder("Slider range unavailable");
         }
         let value = (value.as_f64().unwrap_or(f64::from(min)) as f32).clamp(min, max);
-        let step = self
-            .resolve(node, "step", &key.scope)
-            .as_f64()
-            .map(|step| step as f32)
-            .filter(|step| *step > 0. && step.is_finite())
-            .unwrap_or_else(|| {
-                if min.fract() == 0. && max.fract() == 0. {
-                    1.
-                } else {
-                    (max - min) / 100.
-                }
-            });
+        let step = if self.surface.version == crate::Version::V1 {
+            node.property("steps")
+                .as_u64()
+                .map(|steps| (max - min) / steps as f32)
+        } else {
+            self.resolve(node, "step", &key.scope)
+                .as_f64()
+                .map(|step| step as f32)
+        }
+        .filter(|step| *step > 0. && step.is_finite())
+        .unwrap_or_else(|| {
+            if min.fract() == 0. && max.fract() == 0. {
+                1.
+            } else {
+                (max - min) / 100.
+            }
+        });
         let step = step.max(f32::MIN_POSITIVE).min(max - min);
         let state = self.control(
             key,

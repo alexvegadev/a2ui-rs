@@ -56,17 +56,21 @@ Get-Content examples/reservation.jsonl | cargo run --locked -- -
 
 The first command opens a JSONL file. The second reads one A2UI object per line from stdin and renders updates as they arrive. The demo can run locally with the embedded data.
 
+The desktop demo blocks agent-provided remote images and browser navigation by default. Set `A2UI_IMAGE_ORIGIN` or `A2UI_NAVIGATION_ORIGIN` to a trusted HTTP(S) origin to enable the corresponding operation. Each setting matches the scheme, host, and port. The image client uses a request timeout and byte limit and blocks redirects.
+
 ## Embed in a GPUI app
 
 Initialize GPUI Kit and create an `Entity<A2uiView>` with `cx.new(|_| A2uiView::default())`. Render the entity in your GPUI layout. Pass each incoming message to `view.update(cx, |view, cx| view.apply_json(line, cx))`. Subscribe to `ClientEvent` on that entity to forward actions to the agent. Serialize the event for the wire payload and use `event.metadata()` for the optional surface data model transport metadata.
 
 `Document` is the protocol state without a window. Use it to apply messages, inspect surfaces, resolve bound values, or test action payloads independently from GPUI.
 
+Use `ProtocolError::path()` to identify the rejected field when validation can locate it. To enable remote images or external links, construct the view with `A2uiView::with_url_policy(|kind, url| ...)` and authorize the destinations separately for `ResourceKind::Image` and `ResourceKind::Navigation`. Apply the same image policy in the host's HTTP client and disable redirects or reauthorize each redirect. Navigation policy applies to the initial URL opened by the renderer.
+
 ## Coverage
 
-- A2UI 1.0 surface creation and initialization, component upserts, model updates, and deletion. The renderer also accepts the v0.9 and v0.9.1 wire forms of these messages.
+- A2UI 1.0 surface creation and initialization, component upserts, model updates, and deletion, with structural validation for those messages and the Basic Catalog component definitions. Invalid component upserts are rejected before state changes. The renderer also accepts the v0.9 and v0.9.1 wire forms of these messages.
 - Progressive rendering, recursive component lookup, template lists with relative paths, and two-way binding for standard form controls.
-- Basic Catalog layouts, text and Markdown, images and icons, tabs, dialogs, native form inputs, local validation, and event actions. Agent color and attribution can be supplied in the surface theme.
-- HTTP(S) audio and video targets open in the system browser. Formatting uses English conventions and supports common date patterns. The implementation covers the Basic Catalog and surface rendering workflow. Full JSON Schema validation, custom catalog registration, and v1.0 agent/renderer function RPC are outside the current coverage.
+- Basic Catalog layouts, text and Markdown, images and icons, tabs, dialogs, native form inputs, local validation, and event actions. Legacy surfaces support agent color and attribution in the surface theme.
+- HTTP(S) audio and video targets can open in the system browser when authorized by the host. Formatting uses English conventions and supports common date patterns. Full JSON Schema conformance, custom catalog registration, and v1.0 agent/renderer function RPC are outside the current coverage.
 
 Protocol references: [A2UI messages](https://a2ui.org/concepts/messages/) and [Basic Catalog](https://a2ui.org/specification/v1.0-basic-catalog-implementation-guide/).

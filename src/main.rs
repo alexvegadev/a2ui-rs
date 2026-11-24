@@ -52,12 +52,16 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let media_policy = media::MediaPolicy::from_env().unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
-            cx.set_http_client(Arc::new(media::ImageHttpClient::new()));
+            cx.set_http_client(Arc::new(media::ImageHttpClient::new(media_policy.clone())));
             cx.set_quit_mode(QuitMode::LastWindowClosed);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -72,7 +76,7 @@ fn main() {
                 ..Default::default()
             };
             if let Err(error) = gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Desktop::new(mode, window, cx))
+                cx.new(|cx| Desktop::new(mode, media_policy, window, cx))
             }) {
                 eprintln!("Could not open the renderer: {error}");
                 cx.quit();
@@ -153,8 +157,14 @@ struct AgentChat {
 }
 
 impl Desktop {
-    fn new(mode: Mode, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let client = cx.new(|_| A2uiView::default());
+    fn new(
+        mode: Mode,
+        media_policy: media::MediaPolicy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let client =
+            cx.new(|_| A2uiView::with_url_policy(move |kind, url| media_policy.allows(kind, url)));
         let actions = cx.subscribe(&client, |this, _, action: &ClientEvent, cx| {
             if let Ok(json) = serde_json::to_string(action) {
                 println!("{json}");

@@ -13,6 +13,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "unicode-ident",
  "ureq",
  "url",
  "uuid",
